@@ -72,6 +72,8 @@ class DataParallelPPOActor(BasePPOActor):
         )
         self.device_name = get_device_name()
 
+        self.mask_logprob_before_KL = self.config.get("mask_logprob_before_KL", True)
+
     def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
@@ -401,8 +403,9 @@ class DataParallelPPOActor(BasePPOActor):
                         ref_log_prob = data["ref_log_prob"]
 
                         # masking first before computing KL loss, for more stable training
-                        log_prob = log_prob * response_mask
-                        ref_log_prob = ref_log_prob * response_mask
+                        if self.mask_logprob_before_KL:
+                            log_prob = log_prob * response_mask
+                            ref_log_prob = ref_log_prob * response_mask
 
                         # compute kl loss
                         kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type)
