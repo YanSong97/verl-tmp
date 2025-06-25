@@ -14,6 +14,7 @@
 import logging
 from collections.abc import AsyncGenerator
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+import os
 
 import cloudpickle
 import ray
@@ -163,6 +164,7 @@ class AsyncvLLMServer(AsyncServerBase):
 
         engine_args = AsyncEngineArgs(
             model=local_path,
+            tokenizer=os.environ["TOKENIZER_CHAT_PATH"], #"/mnt/data/shared_home/y50045688/ys/code/LPM2/src/models/qwen2",
             enable_sleep_mode=True,
             override_generation_config=kwargs,
             tensor_parallel_size=tensor_parallel_size,
