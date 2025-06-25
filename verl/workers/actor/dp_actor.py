@@ -399,6 +399,11 @@ class DataParallelPPOActor(BasePPOActor):
 
                     if self.config.use_kl_loss:
                         ref_log_prob = data["ref_log_prob"]
+
+                        # masking first before computing KL loss, for more stable training
+                        log_prob = log_prob * response_mask
+                        ref_log_prob = ref_log_prob * response_mask
+
                         # compute kl loss
                         kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type)
                         kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
