@@ -73,6 +73,9 @@ class DataParallelPPOActor(BasePPOActor):
         self.device_name = get_device_name()
 
         self.mask_logprob_before_KL = self.config.get("mask_logprob_before_KL", True)
+        self.clip_all_logprob = self.config.get('clip_all_logprob', True)
+        self.clip_all_logprob_min = self.config.get("clip_all_logprob_min", -30)
+        self.clip_all_logprob_max = self.config.get("clip_all_logprob_max", 0)
 
     def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -379,6 +382,16 @@ class DataParallelPPOActor(BasePPOActor):
                         calculate_entropy = True
                     entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy)
 
+                    metrics["actor/min_raw_old_log_prob"] = old_log_prob.min().detach().item()
+                    metrics["actor/min_raw_log_prob"] = log_prob.min().detach().item()
+
+                    if self.clip_all_logprob:       # clip all logprob during training
+                        log_prob = torch.clamp(log_prob, min=self.clip_all_logprob_min, max=self.clip_all_logprob_max)
+                        old_log_prob = torch.clamp(old_log_prob, min=self.clip_all_logprob_min, max=self.clip_all_logprob_max)
+
+                        was_clipped = (log_prob < self.clip_all_logprob_min) | (log_prob > self.clip_all_logprob_max)
+                        metrics["actor/raw_old_log_prob_clip_ratio"] = was_clipped.float().mean().item()
+
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
                         old_log_prob=old_log_prob,
                         log_prob=log_prob,
@@ -401,11 +414,15 @@ class DataParallelPPOActor(BasePPOActor):
 
                     if self.config.use_kl_loss:
                         ref_log_prob = data["ref_log_prob"]
+                        metrics["actor/min_raw_ref_log_prob"] = ref_log_prob.min().detach().item()
 
                         # masking first before computing KL loss, for more stable training
                         if self.mask_logprob_before_KL:
                             log_prob = log_prob * response_mask
                             ref_log_prob = ref_log_prob * response_mask
+
+                        if self.clip_all_logprob:
+                            ref_log_prob = torch.clamp(ref_log_prob, min=self.clip_all_logprob_min, max=self.clip_all_logprob_max)
 
                         # compute kl loss
                         kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type)
