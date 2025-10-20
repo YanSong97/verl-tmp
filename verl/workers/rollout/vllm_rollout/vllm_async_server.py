@@ -154,7 +154,7 @@ class AsyncvLLMServer(AsyncServerBase):
         # user can still override them by passing kwargs in each request.
         kwargs = dict(
             n=1,
-            logprobs=0,
+            logprobs=config.n_return_engine_log_prob if config.get("n_return_engine_log_prob", False) else 0,
             max_tokens=config.response_length,
         )
         for k in config.keys():
@@ -162,9 +162,14 @@ class AsyncvLLMServer(AsyncServerBase):
                 kwargs[k] = config.get(k)
         print(f"override_generation_config: {kwargs}")
 
+        if os.environ.get("TOKENIZER_CHAT_PATH", None) is not None:
+            tokenizer_chat_template_path = os.environ["TOKENIZER_CHAT_PATH"]
+        else:
+            tokenizer_chat_template_path = config.tokenizer_chat_template_path
+
         engine_args = AsyncEngineArgs(
             model=local_path,
-            tokenizer=os.environ["TOKENIZER_CHAT_PATH"], #"/mnt/data/shared_home/y50045688/ys/code/LPM2/src/models/qwen2",
+            tokenizer=tokenizer_chat_template_path, #"/mnt/data/shared_home/y50045688/ys/code/LPM2/src/models/qwen2",
             enable_sleep_mode=True,
             override_generation_config=kwargs,
             tensor_parallel_size=tensor_parallel_size,
@@ -183,13 +188,14 @@ class AsyncvLLMServer(AsyncServerBase):
             enable_prefix_caching=True,
             trust_remote_code=trust_remote_code,
             seed=self.vllm_dp_rank,
+            # disable_log_requests=True,
         )
 
         # init async llm engine
         vllm_config = engine_args.create_engine_config()
         namespace = ray.get_runtime_context().namespace
         vllm_config.instance_id = f"{namespace}:{self.wg_prefix}:{self.vllm_dp_size}:{self.vllm_dp_rank}"
-        self.engine = AsyncLLM.from_vllm_config(vllm_config)
+        self.engine = AsyncLLM.from_vllm_config(vllm_config, disable_log_requests=False)
 
         # build serving chat
         model_config = self.engine.model_config
