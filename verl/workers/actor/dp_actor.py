@@ -386,6 +386,9 @@ class DataParallelPPOActor(BasePPOActor):
                     metrics["actor/min_raw_log_prob"] = log_prob.min().detach().item()
 
                     if self.clip_all_logprob:       # clip all logprob during training
+                        log_prob = torch.clamp(log_prob, min=self.clip_all_logprob_min, max=self.clip_all_logprob_max)
+                        old_log_prob = torch.clamp(old_log_prob, min=self.clip_all_logprob_min, max=self.clip_all_logprob_max)
+
                         was_clipped = (log_prob < self.clip_all_logprob_min) | (log_prob > self.clip_all_logprob_max)
                         metrics["actor/raw_old_log_prob_clip_ratio"] = was_clipped.float().mean().item()
 
