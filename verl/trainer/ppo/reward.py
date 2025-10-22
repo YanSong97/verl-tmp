@@ -128,12 +128,16 @@ def load_reward_manager(config, tokenizer, num_examine, **reward_kwargs):
         else:
             final_compute_score = default_compute_score
 
+    # Get custom reward function configuration
+    custom_reward_config = config.get("custom_reward_function") or {}
+    
     # Instantiate and return the reward manager with the specified parameters
     return reward_manager_cls(
         tokenizer=tokenizer,
         num_examine=num_examine,
         compute_score=final_compute_score,
         reward_fn_key=config.data.reward_fn_key,
+        custom_reward_config=custom_reward_config,
         **reward_kwargs,
     )
 

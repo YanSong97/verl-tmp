@@ -626,7 +626,7 @@ class RayPPOTrainer:
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
-    def _dump_generations(self, inputs, outputs, scores, reward_extra_infos_dict, dump_path):
+    def _dump_generations(self, inputs, outputs, scores, reward_extra_infos_dict, dump_path, groundtruth=None):
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
@@ -635,6 +635,7 @@ class RayPPOTrainer:
         base_data = {
             "input": inputs,
             "output": outputs,
+            "groundtruth": groundtruth,
             "score": scores,
             "step": [self.global_steps] * n,
         }
@@ -686,6 +687,7 @@ class RayPPOTrainer:
         sample_outputs = []
         sample_scores = []
         sample_turns = []
+        sample_gt = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -704,6 +706,13 @@ class RayPPOTrainer:
             # TODO: Can we keep special tokens except for padding tokens?
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
+            # Handle ground_truth which might be a single value or list
+
+            ground_truth = test_batch.non_tensor_batch['golden_answers']
+            if isinstance(ground_truth, np.ndarray):
+                sample_gt.extend(ground_truth.tolist())
+            else:
+                sample_gt.extend(ground_truth)
 
             batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
             non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
@@ -780,6 +789,7 @@ class RayPPOTrainer:
 
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
+
         if val_data_dir:
             self._dump_generations(
                 inputs=sample_inputs,
@@ -787,6 +797,7 @@ class RayPPOTrainer:
                 scores=sample_scores,
                 reward_extra_infos_dict=reward_extra_infos_dict,
                 dump_path=val_data_dir,
+                groundtruth=sample_gt
             )
 
         for key_info, lst in reward_extra_infos_dict.items():

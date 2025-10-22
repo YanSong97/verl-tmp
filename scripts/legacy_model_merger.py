@@ -17,10 +17,25 @@ This script is used to merge huggingface model and test verl checkpoints from FS
 
 To merge FSDP checkpoints:
 ```sh
-python scripts/legacy_model_merger.py merge \
+python verl/scripts/legacy_model_merger.py merge \
     --backend fsdp \
-    --local_dir checkpoints/verl_fsdp_gsm8k_examples/qwen2_5_0b5_fsdp_saveload/global_step_1/actor \
-    --target_dir /path/to/merged_hf_model
+    --local_dir /mnt/data0/ys/code/Agentic_LLM_LX/checkpoints/search_async/EXP_Qwen2.5-7B_search_turn8_local_wiki_synthetic_search0928_20250928_090925/global_step_50/actor \
+    --hf_model_path /mnt/data0/ys/code/Agentic_LLM_LX/checkpoints/search_async/EXP_Qwen2.5-7B_search_turn8_local_wiki_synthetic_search0928_20250928_090925/global_step_50/actor/huggingface \
+    --target_dir /mnt/data0/ys/code/Agentic_LLM_LX/checkpoints/search_async/EXP_Qwen2.5-7B_search_turn8_local_wiki_synthetic_search0928_20250928_090925/global_step_50/actor/huggingface
+
+python verl/scripts/legacy_model_merger.py merge \
+    --backend fsdp \
+    --local_dir /mnt/data0/ys/code/Agentic_LLM_LX/checkpoints/search_async/EXP_Qwen3-8B_search_turn8_llm_judge_distributed_local_wiki_webwalker-browse-gaia_20250918_012825/global_step_100/actor/ \
+    --hf_model_path /mnt/data0/ys/code/Agentic_LLM_LX/checkpoints/search_async/EXP_Qwen3-8B_search_turn8_llm_judge_distributed_local_wiki_webwalker-browse-gaia_20250918_012825/global_step_100/actor/huggingface/ \
+    --target_dir /mnt/data0/ys/code/Agentic_LLM_LX/checkpoints/search_async/EXP_Qwen3-8B_search_turn8_llm_judge_distributed_local_wiki_webwalker-browse-gaia_20250918_012825/global_step_100/actor/huggingface/
+
+python verl/scripts/legacy_model_merger.py merge \
+    --backend fsdp \
+    --local_dir /mnt/data0/ys/code/Agentic_LLM_LX/checkpoints/search_async/EXP_Qwen3-8B_search_turn8_mcp_rag_webwalker_qa_search_20250907_014431/global_step_250/actor \
+    --hf_model_path /mnt/data0/ys/code/Agentic_LLM_LX/checkpoints/search_async/EXP_Qwen3-8B_search_turn8_mcp_rag_webwalker_qa_search_20250907_014431/global_step_250/actor/huggingface \
+    --target_dir /mnt/data0/ys/code/Agentic_LLM_LX/checkpoints/search_async/EXP_Qwen3-8B_search_turn8_mcp_rag_webwalker_qa_search_20250907_014431/global_step_250/actor/huggingface
+
+
 ```
 
 To merge Megatron checkpoints:

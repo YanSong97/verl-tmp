@@ -109,6 +109,7 @@ class AgentLoopMetrics(BaseModel):
 
     generate_sequences: float = 0.0
     tool_calls: float = 0.0
+    others: dict = {}
 
 
 class AgentLoopOutput(BaseModel):
@@ -119,6 +120,7 @@ class AgentLoopOutput(BaseModel):
     response_mask: list[int]
     num_turns: int = 0
     metrics: AgentLoopMetrics
+    special_ids: list[int] = []
 
 
 # make hydra.utils.instantiate happy
@@ -251,10 +253,15 @@ class AgentLoopWorker:
             response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
         """
         config = self.config.actor_rollout_ref.rollout
+        stop_words = config.get("stop_words", None)
+        if stop_words is not None:
+            stop_words = list(stop_words)
+
         sampling_params = dict(
             temperature=config.temperature,
             top_p=config.top_p,
             repetition_penalty=1.0,
+            stop=stop_words
         )
 
         # override sampling params for validation
@@ -301,6 +308,9 @@ class AgentLoopWorker:
             validate=trajectory["validate"],
             name="agent_loop",
         ):
+            if isinstance(agent_name, np.ndarray):
+                agent_name = agent_name.item()
+
             assert agent_name in _agent_loop_registry, (
                 f"Agent loop {agent_name} not registered, registered agent loops: {_agent_loop_registry.keys()}"
             )
@@ -363,17 +373,42 @@ class AgentLoopWorker:
         attention_mask = torch.cat([prompt_attention_mask, response_attention_mask], dim=1)
         position_ids = (attention_mask.cumsum(dim=1) - 1) * attention_mask
 
-        batch = TensorDict(
-            {
+        # special ids
+        if len(inputs[0].special_ids) > 0:
+            special_outputs = self.tokenizer.pad(
+                [{"input_ids": input.special_ids} for input in inputs],
+                padding="max_length",
+                max_length=self.config.actor_rollout_ref.rollout.special_response_length,
+                return_tensors="pt",
+                return_attention_mask=True,
+            )
+            special_ids, special_attention_mask = special_outputs['input_ids'], special_outputs['attention_mask']
+
+            batch = TensorDict(
+                {
                 "prompts": prompt_ids,  # [bsz, prompt_length]
                 "responses": response_ids,  # [bsz, response_length]
                 "response_mask": response_mask,  # [bsz, response_length]
                 "input_ids": input_ids,  # [bsz, prompt_length + response_length]
                 "attention_mask": attention_mask,  # [bsz, prompt_length + response_length]
                 "position_ids": position_ids,  # [bsz, prompt_length + response_length]
-            },
-            batch_size=len(input_ids),
-        )
+                "special_ids": special_ids,
+                },
+                batch_size=len(input_ids),
+            )
+
+        else:
+            batch = TensorDict(
+                {
+                    "prompts": prompt_ids,  # [bsz, prompt_length]
+                    "responses": response_ids,  # [bsz, response_length]
+                    "response_mask": response_mask,  # [bsz, response_length]
+                    "input_ids": input_ids,  # [bsz, prompt_length + response_length]
+                    "attention_mask": attention_mask,  # [bsz, prompt_length + response_length]
+                    "position_ids": position_ids,  # [bsz, prompt_length + response_length]
+                },
+                batch_size=len(input_ids),
+            )
 
         num_turns = np.array([input.num_turns for input in inputs], dtype=np.int32)
         metrics = [input.metrics.model_dump() for input in inputs]
@@ -503,8 +538,8 @@ class AgentLoopManager:
         # calculate performance metrics
         metrics = [output.meta_info["metrics"] for output in outputs]  # List[List[Dict[str, str]]]
         timing = self._performance_metrics(metrics, output)
-
-        output.meta_info = {"timing": timing}
+        others = self._other_metrics(metrics)
+        output.meta_info = {"timing": timing, "others": others}
         return output
 
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:
@@ -528,6 +563,23 @@ class AgentLoopManager:
         timing["agent_loop/slowest/response_length"] = attention_mask[prompt_length:].sum().item()
 
         return timing
+
+    def _other_metrics(self, metrics: list[list[dict[str, str]]]):
+        stats = {}
+        metric_keys = list(metrics[0][0]['others'].keys())
+
+        for k in metric_keys:
+            metric_array = np.array([metric['others'][k] for chunk in metrics for metric in chunk])
+            stats[k] = metric_array
+
+        # early_stop_rate = np.array([metric['others'].get("early_stop", 0.) for chunk in metrics for metric in chunk])
+        # success_rate = np.array([metric['others'].get("success_rate", 0.) for chunk in metrics for metric in chunk])
+
+        # stats['early_stop_rate'] = early_stop_rate.mean()
+        # stats['success_rate'] = success_rate
+
+        return stats
+
 
     def wake_up(self):
         """Wake up all rollout server instances."""

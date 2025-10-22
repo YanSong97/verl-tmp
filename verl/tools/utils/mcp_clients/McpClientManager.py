@@ -20,7 +20,7 @@ from typing import Any
 from fastmcp import Client
 from fastmcp.client.transports import SSETransport
 
-from verl.tools.utils.mcp_clients.utils import TokenBucket, mcp2openai
+from verl.tools.utils.mcp_clients.utils import TokenBucket, RPMBucket, mcp2openai
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +32,7 @@ class MCPClientManager:
     tool_client_mapping = {}
     rate_limiter = None
 
-    async def initialize(self, config_path, rate_limit: float = 10.0):
+    async def initialize(self, config_path, rate_limit: float = 10.0, rate_limit_type: str = "per_second"):
         if self.initialized:
             return
         """Initialize the MCP Client Manager and start all clients"""
@@ -51,8 +51,11 @@ class MCPClientManager:
         if exclude_sse_servers[self.rootServerName]:
             self.clients.append(Client(exclude_sse_servers))
 
-        # Initialize rate limiter
-        self.rate_limiter = TokenBucket(rate_limit)
+        # Initialize rate limiter based on type
+        if rate_limit_type == "per_minute":
+            self.rate_limiter = CallBucket(int(rate_limit))
+        else:  # default to per_second
+            self.rate_limiter = TokenBucket(rate_limit)
         self.initialized = True
 
     async def call_tool(self, tool_name, parameters, timeout):

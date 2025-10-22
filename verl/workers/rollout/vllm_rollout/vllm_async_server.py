@@ -224,7 +224,7 @@ class AsyncvLLMServer(AsyncServerBase):
         # user can still override them by passing kwargs in each request.
         kwargs = dict(
             n=1,
-            logprobs=0,
+            logprobs=config.n_return_engine_log_prob if config.get("n_return_engine_log_prob", False) else 0,
             repetition_penalty=1.0,
             max_new_tokens=config.response_length,
         )
@@ -241,8 +241,14 @@ class AsyncvLLMServer(AsyncServerBase):
         else:
             distributed_executor_backend = None
 
+        if config.get("tokenizer_chat_template_path", None) is not None:
+            tokenizer_chat_template_path = config.tokenizer_chat_template_path
+        else:
+            tokenizer_chat_template_path = local_path
+
         engine_args = AsyncEngineArgs(
             model=local_path,
+            tokenizer=tokenizer_chat_template_path,
             enable_sleep_mode=config.free_cache_engine,
             override_generation_config=kwargs,
             tensor_parallel_size=tensor_parallel_size,
@@ -326,6 +332,20 @@ class AsyncvLLMServer(AsyncServerBase):
         assert final_res is not None
 
         return final_res.outputs[0].token_ids
+
+    async def generate_raw(self, prompt_ids: list[int], sampling_params: dict[str, Any], request_id: str) -> list[int]:
+        max_tokens = self.max_model_len - len(prompt_ids)
+        sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
+        prompt = TokensPrompt(prompt_token_ids=prompt_ids)
+        generator = self.engine.generate(prompt=prompt, sampling_params=sampling_params, request_id=request_id)
+
+        # Get final response
+        final_res: Optional[RequestOutput] = None
+        async for output in generator:
+            final_res = output
+        assert final_res is not None
+
+        return final_res
 
     async def wake_up(self):
         if self.config.rollout.free_cache_engine:

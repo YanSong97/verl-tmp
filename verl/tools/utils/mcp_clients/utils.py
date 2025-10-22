@@ -42,6 +42,88 @@ class TokenBucket:
             return False
 
 
+class RPMBucket:
+    def __init__(self, rate_limit: float):
+        self.RPM = rate_limit * 60      # request per minute
+        self.rate_limit = rate_limit
+        self.current_request = self.RPM
+        self.last_update = time.time()
+        self.lock = threading.Lock()
+
+    def acquire(self) -> bool:
+        with self.lock:
+            now = time.time()
+
+            new_request = (now - self.last_update) * self.rate_limit
+            self.current_request = min(self.RPM, self.current_request + new_request)
+            self.last_update = now
+
+            if self.current_request >= 1:
+                self.current_request -= 1
+                return True
+
+            print(f"### Waiting for RPMBucket to be topped up... Current request budget {self.current_request}")
+            return False
+
+
+
+
+
+
+
+class CallBucket:
+    def __init__(self, calls_per_minute: int):
+        self.calls_per_minute = calls_per_minute
+        self.max_calls = calls_per_minute
+        self.calls = calls_per_minute  # Start with full bucket
+        self.last_update = time.time()
+        self.lock = threading.Lock()
+
+    def acquire(self) -> bool:
+        with self.lock:
+            now = time.time()
+            # Calculate minutes elapsed since last update
+            minutes_elapsed = (now - self.last_update) / 60.0
+            
+            # Add new calls based on time elapsed (calls per minute)
+            new_calls = minutes_elapsed * self.calls_per_minute
+            self.calls = min(self.max_calls, self.calls + new_calls)
+            self.last_update = now
+
+            if self.calls >= 1:
+                self.calls -= 1
+                return True
+            return False
+
+    def get_remaining_calls(self) -> int:
+        """Get the number of remaining calls available"""
+        with self.lock:
+            now = time.time()
+            minutes_elapsed = (now - self.last_update) / 60.0
+            new_calls = minutes_elapsed * self.calls_per_minute
+            current_calls = min(self.max_calls, self.calls + new_calls)
+            return int(current_calls)
+
+    def get_time_to_next_call(self) -> float:
+        """Get time in seconds until next call is available"""
+        with self.lock:
+            if self.calls >= 1:
+                return 0.0
+            
+            now = time.time()
+            minutes_elapsed = (now - self.last_update) / 60.0
+            new_calls = minutes_elapsed * self.calls_per_minute
+            current_calls = min(self.max_calls, self.calls + new_calls)
+            
+            if current_calls >= 1:
+                return 0.0
+            
+            # Calculate how many minutes we need to wait for 1 call
+            calls_needed = 1 - current_calls
+            minutes_needed = calls_needed / self.calls_per_minute
+            return minutes_needed * 60.0
+
+
 def mcp2openai(mcp_tool: Tool) -> dict:
     """Convert a MCP Tool to an OpenAI ChatCompletionTool."""
     openai_format = {

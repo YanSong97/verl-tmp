@@ -18,6 +18,8 @@ from .dapo import DAPORewardManager
 from .naive import NaiveRewardManager
 from .prime import PrimeRewardManager
 
+import src.workers.reward_manager
+
 # Note(haibin.lin): no need to include all reward managers here in case of complicated dependencies
 __all__ = [
     "BatchRewardManager",

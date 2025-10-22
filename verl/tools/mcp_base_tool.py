@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import asyncio
 import json
 import logging
 import os
@@ -64,16 +64,36 @@ class MCPBaseTool(BaseTool):
         err_msg = ""
         try:
             call_tool_result = await ClientManager.call_tool(self.name, parameters, self.timeout)
+            logger.debug(f"Tool result for instance {instance_id} with tool {self.name}: {call_tool_result.content}")
+            result, metadata = self._parse_tool_result(call_tool_result.content)
+            metadata["api_request_error"] += err_msg
+            return result, metadata
+        except asyncio.CancelledError:
+            # This happens when the MCP operation times out or is cancelled
+            logger.error(f"MCP operation was cancelled/timed out for instance {instance_id}")
+            err_msg = f"asyncio cancelled error "
+            # raise asyncio.CancelledError("MCP operation timed out")
         except ClientError as e:
             err_msg = f"\n Tool call failed: {e}"
         except ConnectionError as e:
             err_msg = f"\n Connection failed: {e}"
         except Exception as e:
             err_msg = f"\n An unexpected error occurred: {e}"
+            # Re-raise other exceptions
+            # raise e
 
-        logger.debug(f"Tool result for instance {instance_id} with tool {self.name}: {call_tool_result.content}")
-        result, metadata = self._parse_tool_result(call_tool_result.content)
-        metadata["api_request_error"] += err_msg
+        # except ClientError as e:
+        #     err_msg = f"\n Tool call failed: {e}"
+        # except ConnectionError as e:
+        #     err_msg = f"\n Connection failed: {e}"
+        # except Exception as e:
+        #     err_msg = f"\n An unexpected error occurred: {e}"
+
+        # logger.debug(f"Tool result for instance {instance_id} with tool {self.name}: {call_tool_result.content}")
+        # result, metadata = self._parse_tool_result(call_tool_result.content)
+
+        metadata = {}
+        metadata["api_request_error"] = err_msg
         return result, metadata
 
     @rollout_trace_op
@@ -100,7 +120,7 @@ class MCPBaseTool(BaseTool):
             return result_text, 0.0, metrics
 
         except Exception as e:
-            error_result = json.dumps({"result": f"Tool execution failed: {e}"})
+            error_result = json.dumps({"result": f"## [Error] Tool execution failed: {e}"})
             logger.error(f"[MCPBaseTool] Execution failed: {e}")
             return error_result, 0.0, {"error": str(e)}
 
