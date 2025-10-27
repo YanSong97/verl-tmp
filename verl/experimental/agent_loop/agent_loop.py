@@ -18,6 +18,7 @@ import os
 import random
 from abc import ABC, abstractmethod
 from typing import Any
+import time
 
 import hydra
 import numpy as np
@@ -32,6 +33,7 @@ from transformers import AutoTokenizer
 from verl.protocol import DataProto
 from verl.single_controller.ray.base import RayWorkerGroup
 from verl.utils import hf_tokenizer
+from verl.utils.debug import marked_timer
 from verl.utils.fs import copy_to_local
 from verl.utils.rollout_trace import RolloutTraceConfig, rollout_trace_attr, rollout_trace_op
 from verl.workers.rollout.async_server import async_server_class
@@ -109,6 +111,7 @@ class AgentLoopMetrics(BaseModel):
 
     generate_sequences: float = 0.0
     tool_calls: float = 0.0
+    worker_run_time: float = 0.0
     others: dict = {}
 
 
@@ -290,7 +293,6 @@ class AgentLoopWorker:
                 asyncio.create_task(self._run_agent_loop(agent_name, messages.tolist(), sampling_params, trajectory))
             )
         outputs = await asyncio.gather(*tasks)
-
         output = self._postprocess(outputs)
         return output
 
@@ -522,23 +524,35 @@ class AgentLoopManager:
         Returns:
             DataProto: Output batch.
         """
-        if self.config.actor_rollout_ref.rollout.free_cache_engine:
-            self.wake_up()
-        chunkes = prompts.chunk(len(self.agent_loop_workers))
-        outputs = ray.get(
-            [
-                worker.generate_sequences.remote(chunk)
-                for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
-            ]
-        )
-        output = DataProto.concat(outputs)
-        if self.config.actor_rollout_ref.rollout.free_cache_engine:
-            self.sleep()
+        timing_raw = {}
+        
+        with marked_timer("engine_wake_sleep", timing_raw, color="purple"):
+            if self.config.actor_rollout_ref.rollout.free_cache_engine:
+                self.wake_up()
+            chunkes = prompts.chunk(len(self.agent_loop_workers))
+        
+        # Submit all Ray tasks and track timing
+        ray_tasks = [
+            worker.generate_sequences.remote(chunk)
+            for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
+        ]
+        with marked_timer("ray_get_results", timing_raw, color="red"):
+            outputs = ray.get(ray_tasks)  # Total time ≈ slowest task
+        
+        with marked_timer("engine_wake_sleep", timing_raw, color="purple"):
+            output = DataProto.concat(outputs)
+            if self.config.actor_rollout_ref.rollout.free_cache_engine:
+                self.sleep()
 
         # calculate performance metrics
         metrics = [output.meta_info["metrics"] for output in outputs]  # List[List[Dict[str, str]]]
         timing = self._performance_metrics(metrics, output)
         others = self._other_metrics(metrics)
+        
+        # Add timing_raw to the timing metrics
+        for key, val in timing_raw.items():
+            timing[f"agent_loop_manager/execution/{key}"] = val
+
         output.meta_info = {"timing": timing, "others": others}
         return output
 
@@ -546,21 +560,49 @@ class AgentLoopManager:
         timing = {}
         t_generate_sequences = np.array([metric["generate_sequences"] for chunk in metrics for metric in chunk])
         t_tool_calls = np.array([metric["tool_calls"] for chunk in metrics for metric in chunk])
-        timing["agent_loop/generate_sequences/min"] = t_generate_sequences.min()
-        timing["agent_loop/generate_sequences/max"] = t_generate_sequences.max()
-        timing["agent_loop/generate_sequences/mean"] = t_generate_sequences.mean()
-        timing["agent_loop/tool_calls/min"] = t_tool_calls.min()
-        timing["agent_loop/tool_calls/max"] = t_tool_calls.max()
-        timing["agent_loop/tool_calls/mean"] = t_tool_calls.mean()
+        t_worker_run_time = np.array([metric["worker_run_time"] for chunk in metrics for metric in chunk])
+        # timing["agent_loop/worker_run_time/min"] = t_worker_run_time.min()
+        # timing["agent_loop/worker_run_time/max"] = t_worker_run_time.max()
+        # timing["agent_loop/worker_run_time/mean"] = t_worker_run_time.mean()
+        timing["agent_loop/execution/worker_run_time"] = t_worker_run_time.max()
+        # timing["agent_loop/generate_sequences/min"] = t_generate_sequences.min()
+        # timing["agent_loop/generate_sequences/max"] = t_generate_sequences.max()
+        # timing["agent_loop/generate_sequences/mean"] = t_generate_sequences.mean()
+        timing["agent_loop/avg/generate_sequences"] = t_generate_sequences.mean()
+        timing["agent_loop/avg/tool_calls"] = t_tool_calls.mean()
+        # timing["agent_loop/tool_calls/min"] = t_tool_calls.min()
+        # timing["agent_loop/tool_calls/max"] = t_tool_calls.max()
+        # timing["agent_loop/tool_calls/mean"] = t_tool_calls.mean()
+
+        # Calculate tokens/s for generation
+        response_mask = output.batch["response_mask"]
+        prompt_length = output.batch["prompts"].shape[1]
+        # Calculate response lengths for all samples
+        response_lengths = response_mask.sum(dim=1).cpu().numpy()
+        # Calculate tokens/s for each sample (avoid division by zero)
+        tokens_per_sec = np.divide(response_lengths, t_generate_sequences, 
+                                   out=np.zeros_like(response_lengths, dtype=float), 
+                                   where=t_generate_sequences > 0)
+        # timing["agent_loop/tokens_per_sec/min"] = tokens_per_sec.min()
+        # timing["agent_loop/tokens_per_sec/max"] = tokens_per_sec.max()
+        timing["agent_loop/throughput/tokens_per_sec_per_worker"] = tokens_per_sec.mean()
+        
+        # Calculate total throughput: total tokens / max time (parallel execution bottleneck)
+        total_tokens = response_lengths.sum()
+        max_generation_time = t_generate_sequences.max()
+        if max_generation_time > 0:
+            timing["agent_loop/throughput/total_tokens_per_sec_per_batch"] = total_tokens / max_generation_time
+        else:
+            timing["agent_loop/throughput/total_tokens_per_sec_per_batch"] = 0.0
 
         # batch sequence generation is bounded by the slowest sample
-        slowest = np.argmax(t_generate_sequences + t_tool_calls)
-        attention_mask = output.batch["attention_mask"][slowest]
-        prompt_length = output.batch["prompts"].shape[1]
-        timing["agent_loop/slowest/generate_sequences"] = t_generate_sequences[slowest]
-        timing["agent_loop/slowest/tool_calls"] = t_tool_calls[slowest]
-        timing["agent_loop/slowest/prompt_length"] = attention_mask[:prompt_length].sum().item()
-        timing["agent_loop/slowest/response_length"] = attention_mask[prompt_length:].sum().item()
+        # slowest = np.argmax(t_generate_sequences + t_tool_calls)
+        # attention_mask_slowest = attention_mask[slowest]
+        # timing["agent_loop/slowest/generate_sequences"] = t_generate_sequences[slowest]
+        # timing["agent_loop/slowest/tool_calls"] = t_tool_calls[slowest]
+        # timing["agent_loop/slowest/prompt_length"] = attention_mask_slowest[:prompt_length].sum().item()
+        # timing["agent_loop/slowest/response_length"] = attention_mask_slowest[prompt_length:].sum().item()
+        # timing["agent_loop/slowest/tokens_per_sec"] = tokens_per_sec[slowest]
 
         return timing
 
