@@ -575,20 +575,22 @@ class AgentLoopManager:
         # timing["agent_loop/tool_calls/mean"] = t_tool_calls.mean()
 
         # Calculate tokens/s for generation
-        response_mask = output.batch["response_mask"]
-        prompt_length = output.batch["prompts"].shape[1]
+        # response_mask = [i['others']["raw_response_mask"].sum(dim=1).cpu().numpy() for i in metrics]  #output.batch["response_mask"]
+        # prompt_length = output.batch["prompts"].shape[1]
         # Calculate response lengths for all samples
-        response_lengths = response_mask.sum(dim=1).cpu().numpy()
+        # response_lengths = response_mask.sum(dim=1).cpu().numpy()
         # Calculate tokens/s for each sample (avoid division by zero)
-        tokens_per_sec = np.divide(response_lengths, t_generate_sequences, 
-                                   out=np.zeros_like(response_lengths, dtype=float), 
-                                   where=t_generate_sequences > 0)
+        # tokens_per_sec = np.divide(response_lengths, t_generate_sequences,
+        #                            out=np.zeros_like(response_lengths, dtype=float),
+        #                            where=t_generate_sequences > 0)
         # timing["agent_loop/tokens_per_sec/min"] = tokens_per_sec.min()
         # timing["agent_loop/tokens_per_sec/max"] = tokens_per_sec.max()
-        timing["agent_loop/throughput/tokens_per_sec_per_worker"] = tokens_per_sec.mean()
+        # timing["agent_loop/throughput/tokens_per_sec_per_worker"] = tokens_per_sec.mean()
         
         # Calculate total throughput: total tokens / max time (parallel execution bottleneck)
-        total_tokens = response_lengths.sum()
+        # total_tokens = response_lengths.sum()
+        total_tokens = sum([metric['others']["raw_response_mask"] for chunk in metrics for metric in chunk])
+        # total_tokens = sum([i['others']["raw_response_mask"].sum().cpu().numpy() for i in metrics])
         max_generation_time = t_generate_sequences.max()
         if max_generation_time > 0:
             timing["agent_loop/throughput/total_tokens_per_sec_per_batch"] = total_tokens / max_generation_time
