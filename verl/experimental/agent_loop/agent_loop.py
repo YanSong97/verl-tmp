@@ -276,6 +276,7 @@ class AgentLoopWorker:
         tasks = []
         agent_names = batch.non_tensor_batch["agent_name"]
         raw_prompts = batch.non_tensor_batch["raw_prompt"]
+        ev_seeds = batch.non_tensor_batch['seed']
         if "index" in batch.non_tensor_batch:
             index = batch.non_tensor_batch["index"]
         else:
@@ -285,9 +286,9 @@ class AgentLoopWorker:
             batch.meta_info.get("global_steps", -1), index, batch.meta_info.get("validate", False)
         )
 
-        for agent_name, messages, trajectory in zip(agent_names, raw_prompts, trajectory_info, strict=True):
+        for agent_name, messages, trajectory, seed in zip(agent_names, raw_prompts, trajectory_info, ev_seeds, strict=True):
             tasks.append(
-                asyncio.create_task(self._run_agent_loop(agent_name, messages.tolist(), sampling_params, trajectory))
+                asyncio.create_task(self._run_agent_loop(agent_name, messages.tolist(), sampling_params, trajectory, seed))
             )
         outputs = await asyncio.gather(*tasks)
 
@@ -300,6 +301,7 @@ class AgentLoopWorker:
         messages: list[dict[str, Any]],
         sampling_params: dict[str, Any],
         trajectory: dict[str, Any],
+        seed: int,
     ) -> AgentLoopOutput:
         with rollout_trace_attr(
             step=trajectory["step"],
@@ -322,7 +324,7 @@ class AgentLoopWorker:
                 server_manager=self.server_manager,
                 tokenizer=self.tokenizer,
             )
-            output = await agent_loop.run(messages, sampling_params)
+            output = await agent_loop.run(messages, sampling_params, seed)
             return output
 
     def _postprocess(self, inputs: list[AgentLoopOutput]) -> DataProto:
