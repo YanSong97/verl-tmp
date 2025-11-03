@@ -270,7 +270,7 @@ class AsyncvLLMServer(AsyncServerBase):
 
         # init async llm engine
         vllm_config = self._create_engine_config(engine_args)
-        self.engine = AsyncLLM.from_vllm_config(vllm_config)
+        self.engine = AsyncLLM.from_vllm_config(vllm_config, disable_log_requests=True)
 
         # build serving chat
         model_config = self.engine.model_config
@@ -334,8 +334,10 @@ class AsyncvLLMServer(AsyncServerBase):
         return final_res.outputs[0].token_ids
 
     async def generate_raw(self, prompt_ids: list[int], sampling_params: dict[str, Any], request_id: str) -> list[int]:
-        max_tokens = self.max_model_len - len(prompt_ids)
-        sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
+        if "max_tokens" not in sampling_params:
+            sampling_params["max_tokens"] = self.max_model_len - len(prompt_ids)
+
+        sampling_params = SamplingParams(**sampling_params)
         prompt = TokensPrompt(prompt_token_ids=prompt_ids)
         generator = self.engine.generate(prompt=prompt, sampling_params=sampling_params, request_id=request_id)
 

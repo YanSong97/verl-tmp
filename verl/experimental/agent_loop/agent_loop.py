@@ -18,7 +18,7 @@ import os
 import random
 from abc import ABC, abstractmethod
 from typing import Any
-
+import time
 import hydra
 import numpy as np
 import ray
@@ -32,6 +32,7 @@ from transformers import AutoTokenizer
 from verl.protocol import DataProto
 from verl.single_controller.ray.base import RayWorkerGroup
 from verl.utils import hf_tokenizer
+from verl.utils.debug import marked_timer
 from verl.utils.fs import copy_to_local
 from verl.utils.rollout_trace import RolloutTraceConfig, rollout_trace_attr, rollout_trace_op
 from verl.workers.rollout.async_server import async_server_class
@@ -109,6 +110,7 @@ class AgentLoopMetrics(BaseModel):
 
     generate_sequences: float = 0.0
     tool_calls: float = 0.0
+    worker_run_time: float = 0.0
     others: dict = {}
 
 
@@ -548,21 +550,30 @@ class AgentLoopManager:
         timing = {}
         t_generate_sequences = np.array([metric["generate_sequences"] for chunk in metrics for metric in chunk])
         t_tool_calls = np.array([metric["tool_calls"] for chunk in metrics for metric in chunk])
-        timing["agent_loop/generate_sequences/min"] = t_generate_sequences.min()
-        timing["agent_loop/generate_sequences/max"] = t_generate_sequences.max()
-        timing["agent_loop/generate_sequences/mean"] = t_generate_sequences.mean()
-        timing["agent_loop/tool_calls/min"] = t_tool_calls.min()
-        timing["agent_loop/tool_calls/max"] = t_tool_calls.max()
-        timing["agent_loop/tool_calls/mean"] = t_tool_calls.mean()
+        t_worker_run_time = np.array([metric["worker_run_time"] for chunk in metrics for metric in chunk])
+
+        # timing["agent_loop/generate_sequences/min"] = t_generate_sequences.min()
+        # timing["agent_loop/generate_sequences/max"] = t_generate_sequences.max()
+        # timing["agent_loop/generate_sequences/mean"] = t_generate_sequences.mean()
+        # timing["agent_loop/tool_calls/min"] = t_tool_calls.min()
+        # timing["agent_loop/tool_calls/max"] = t_tool_calls.max()
+        # timing["agent_loop/tool_calls/mean"] = t_tool_calls.mean()
+        timing['agent_loop/execution/worker_run_time'] = t_worker_run_time.max()
+
+        response_mask = output.batch["response_mask"]
+        # prompt_length = output.batch["prompts"].shape[1]
+        total_tokens = response_mask.sum()
+        max_generation_time = t_generate_sequences.max()
+        timing["agent_loop/throughput/total_tokens_per_sec_per_batch"] = total_tokens / max_generation_time
 
         # batch sequence generation is bounded by the slowest sample
-        slowest = np.argmax(t_generate_sequences + t_tool_calls)
-        attention_mask = output.batch["attention_mask"][slowest]
-        prompt_length = output.batch["prompts"].shape[1]
-        timing["agent_loop/slowest/generate_sequences"] = t_generate_sequences[slowest]
-        timing["agent_loop/slowest/tool_calls"] = t_tool_calls[slowest]
-        timing["agent_loop/slowest/prompt_length"] = attention_mask[:prompt_length].sum().item()
-        timing["agent_loop/slowest/response_length"] = attention_mask[prompt_length:].sum().item()
+        # slowest = np.argmax(t_generate_sequences + t_tool_calls)
+        # attention_mask = output.batch["attention_mask"][slowest]
+        # prompt_length = output.batch["prompts"].shape[1]
+        # timing["agent_loop/slowest/generate_sequences"] = t_generate_sequences[slowest]
+        # timing["agent_loop/slowest/tool_calls"] = t_tool_calls[slowest]
+        # timing["agent_loop/slowest/prompt_length"] = attention_mask[:prompt_length].sum().item()
+        # timing["agent_loop/slowest/response_length"] = attention_mask[prompt_length:].sum().item()
 
         return timing
 
