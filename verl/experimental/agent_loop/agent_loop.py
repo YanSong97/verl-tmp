@@ -120,6 +120,7 @@ class AgentLoopOutput(BaseModel):
     prompt_ids: list[int]
     response_ids: list[int]
     response_mask: list[int]
+    reward_lst: list[float]
     num_turns: int = 0
     metrics: AgentLoopMetrics
     special_ids: list[int] = []
@@ -359,6 +360,13 @@ class AgentLoopWorker:
         )
         response_ids, response_attention_mask = outputs["input_ids"], outputs["attention_mask"]
 
+        # reward lst
+        reward_ids = []
+        for input in inputs:
+            padded_reward_lst = input.reward_lst + [0.] * (self.config.actor_rollout_ref.rollout.response_length - len(input.reward_lst))
+            reward_ids.append(padded_reward_lst)
+        reward_ids = torch.tensor(reward_ids, dtype=torch.float32)
+
         # response_mask
         outputs = self.tokenizer.pad(
             [{"input_ids": input.response_mask} for input in inputs],
@@ -397,6 +405,7 @@ class AgentLoopWorker:
                 "attention_mask": attention_mask,  # [bsz, prompt_length + response_length]
                 "position_ids": position_ids,  # [bsz, prompt_length + response_length]
                 "special_ids": special_ids,
+                "reward_tensor": reward_ids,
                 },
                 batch_size=len(input_ids),
             )
@@ -410,6 +419,7 @@ class AgentLoopWorker:
                     "input_ids": input_ids,  # [bsz, prompt_length + response_length]
                     "attention_mask": attention_mask,  # [bsz, prompt_length + response_length]
                     "position_ids": position_ids,  # [bsz, prompt_length + response_length]
+                    "reward_tensor": reward_ids,
                 },
                 batch_size=len(input_ids),
             )
