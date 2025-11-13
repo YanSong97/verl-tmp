@@ -793,7 +793,7 @@ def compute_policy_loss(
 
     masked_ratio = verl_F.masked_mean(ratio, response_mask).detach().item()
 
-    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, masked_ratio
+    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 
 @register_policy_loss("gpg")
