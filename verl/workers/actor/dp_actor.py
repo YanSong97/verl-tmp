@@ -49,11 +49,12 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 class DataParallelPPOActor(BasePPOActor):
-    def __init__(self, config, actor_module: nn.Module, actor_optimizer: torch.optim.Optimizer = None):
+    def __init__(self, config, actor_module: nn.Module, actor_optimizer: torch.optim.Optimizer = None, sft_optimizer: torch.optim.Optimizer = None):
         """When optimizer is None, it is Reference Policy"""
         super().__init__(config)
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
+        self.sft_optimizer = sft_optimizer
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
         if torch.distributed.get_rank() == 0:
@@ -286,6 +287,24 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             self.actor_optimizer.step()
         return grad_norm
+    
+    def _sft_optimizer_step(self):
+        assert self.config.sft_loss.grad_clip is not None
+
+        if isinstance(self.actor_module, FSDP):
+            grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.sft_loss.grad_clip)
+        elif isinstance(self.actor_module, FSDPModule):
+            grad_norm = fsdp2_clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.sft_loss.grad_clip)
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.sft_loss.grad_clip)
+
+        # if grad_norm is not finite, skip the update
+        if not torch.isfinite(grad_norm):
+            print(f"WARN (SFT): rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}")
+            self.sft_optimizer.zero_grad()
+        else:
+            self.sft_optimizer.step()
+        return grad_norm
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def compute_log_prob(self, data: DataProto, calculate_entropy=False) -> torch.Tensor:
@@ -483,4 +502,143 @@ class DataParallelPPOActor(BasePPOActor):
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
+        return metrics
+
+    @GPUMemoryLogger(role="dp actor", logger=logger)
+    def update_sft(self, data: DataProto):
+        """Update the actor model using SFT (Supervised Fine-Tuning) loss.
+        
+        Args:
+            data (DataProto): A DataProto containing:
+                - input_ids: tensor of shape [batch_size, sequence_length]
+                - attention_mask: tensor of shape [batch_size, sequence_length]
+                - position_ids: tensor of shape [batch_size, sequence_length]
+                - loss_mask: tensor of shape [batch_size, sequence_length] indicating which tokens to compute loss on
+                - multi_modal_inputs (optional): dict containing multi-modal inputs
+        
+        Returns:
+            dict: A dictionary containing training metrics such as loss, grad_norm, etc.
+        """
+        # make sure we are in training mode
+        self.actor_module.train()
+        sft_config = self.config.sft_loss
+
+        select_keys = [
+            "sft_input_ids",
+            "sft_attention_mask",
+            "sft_position_ids",
+            "sft_loss_mask",
+        ]
+
+        has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
+        non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+
+        data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
+
+        # verl's SFT only has micro batch size
+        sft_micro_batch_size = sft_config.get("sft_micro_batch_size_per_gpu", self.config.get("ppo_micro_batch_size_per_gpu", 1))
+        # balance_dp_token = sft_config.get("balance_dp_token", False)
+
+        use_remove_padding = sft_config.get("use_remove_padding", False)
+        ulysses_sequence_parallel_size = sft_config.get("ulysses_sequence_parallel_size", self.ulysses_sequence_parallel_size)
+        use_ulysses_sp = ulysses_sequence_parallel_size > 1
+
+        # Split to make minibatch iterator for updating the actor
+        micro_batches = data.split(sft_micro_batch_size)
+        n_micro_batches = len(micro_batches)
+
+        metrics = {}
+        loss_fct = nn.CrossEntropyLoss(reduction="none")
+        self.sft_optimizer.zero_grad()
+        
+        for batch_idx, micro_batch in enumerate(micro_batches):
+            micro_batch_metrics = {}
+            model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+            # actor calling
+            with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+                input_ids = model_inputs["sft_input_ids"]
+                attention_mask = model_inputs["sft_attention_mask"]
+                position_ids = model_inputs["sft_position_ids"]
+                loss_mask = model_inputs["sft_loss_mask"][:, :-1].reshape(-1)  # Remove last token and flatten
+                batch_size, seqlen = input_ids.shape
+
+                if use_remove_padding:
+                    input_ids_rmpad, indices, cu_seqlens, *_ = unpad_input(
+                        input_ids.unsqueeze(-1), attention_mask
+                    )  # input_ids_rmpad (total_nnz, ...)
+                    input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
+
+                    if position_ids.dim() == 3:
+                        position_ids_rmpad = (
+                            index_first_axis(rearrange(position_ids, "c b s ... -> (b s) c ..."), indices)
+                            .transpose(0, 1)
+                            .unsqueeze(1)
+                        )
+                    else:
+                        position_ids_rmpad = index_first_axis(
+                            rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices
+                        ).transpose(0, 1)
+
+                    input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)  # (1, total_nnz)
+
+                    if use_ulysses_sp:
+                        input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad_and_slice_inputs(
+                            input_ids_rmpad,
+                            position_ids_rmpad=position_ids_rmpad,
+                            sp_size=ulysses_sequence_parallel_size,
+                        )
+
+                        input_ids_rmpad_rolled, _, _ = ulysses_pad_and_slice_inputs(
+                            input_ids_rmpad_rolled,
+                            position_ids_rmpad=None,
+                            sp_size=ulysses_sequence_parallel_size,
+                        )
+                    
+                    input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
+
+                    output = self.actor_module(
+                        input_ids=input_ids_rmpad,
+                        attention_mask=None,
+                        position_ids=position_ids_rmpad,
+                        use_cache=False,
+                    )
+
+                    # Compute loss locally then aggregate
+                    logits_rmpad = output.logits.squeeze(0)
+                    # input_ids_rmpad_rolled = input_ids_rmpad_rolled.to(logits_rmpad.device)
+                    loss = loss_fct(logits_rmpad, input_ids_rmpad_rolled)
+
+                    if use_ulysses_sp:
+                        loss = gather_outputs_and_unpad(loss, gather_dim=0, unpad_dim=0, padding_size=pad_size)
+                        full_loss = pad_input(hidden_states=loss.unsqueeze(-1), indices=indices, batch=batch_size, seqlen=seqlen)
+                        full_loss = full_loss.squeeze(-1)[:, :-1]  # Remove last token's loss
+                        full_loss = full_loss.reshape(-1)
+                        loss_mask = loss_mask.to(full_loss.device)
+                        loss = full_loss * loss_mask
+                else:
+                    raise ValueError("use_remove_padding must be True")
+                
+                # Compute average loss over valid tokens
+                valid_token_this_rank = torch.sum(loss_mask)
+                dp_size = 1 # no dp balance
+
+                sft_loss = torch.sum(loss) / (valid_token_this_rank + 1e-8) * dp_size
+
+                loss_scaled = sft_loss / n_micro_batches
+                
+                loss_scaled.backward()
+
+                micro_batch_metrics.update(
+                        {
+                            "actor/sft_loss": sft_loss.detach().item(),
+                            "actor/sft_valid_tokens": valid_token_this_rank.detach().item(),
+                        }
+                )
+                append_to_dict(metrics, micro_batch_metrics)
+                
+            grad_norm = self._sft_optimizer_step()
+            mini_batch_metrics = {"actor/sft_grad_norm": grad_norm.detach().item()}
+            append_to_dict(metrics, mini_batch_metrics)
+
+        self.sft_optimizer.zero_grad()
         return metrics

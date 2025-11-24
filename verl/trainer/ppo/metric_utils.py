@@ -179,9 +179,9 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
 
     if "success_rate" in batch.non_tensor_batch:
         success_rate = batch.non_tensor_batch["success_rate"]
-        metrics["success_rate/mean"] = success_rate.mean()
-        metrics["success_rate/max"] = success_rate.max()
-        metrics["success_rate/min"] = success_rate.min()
+        metrics["training/success_rate/mean"] = success_rate.mean()
+        metrics["training/success_rate/max"] = success_rate.max()
+        metrics["training/success_rate/min"] = success_rate.min()
 
     return metrics
 

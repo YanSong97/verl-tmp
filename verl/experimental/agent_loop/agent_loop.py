@@ -36,6 +36,7 @@ from verl.utils.debug import marked_timer
 from verl.utils.fs import copy_to_local
 from verl.utils.rollout_trace import RolloutTraceConfig, rollout_trace_attr, rollout_trace_op
 from verl.workers.rollout.async_server import async_server_class
+from verl.utils.model import compute_position_id_with_mask
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -124,6 +125,7 @@ class AgentLoopOutput(BaseModel):
     num_turns: int = 0
     metrics: AgentLoopMetrics
     special_ids: list[int] = []
+    sft_dataset: list[dict] = []
 
 
 # make hydra.utils.instantiate happy
@@ -385,33 +387,7 @@ class AgentLoopWorker:
         attention_mask = torch.cat([prompt_attention_mask, response_attention_mask], dim=1)
         position_ids = (attention_mask.cumsum(dim=1) - 1) * attention_mask
 
-        # special ids
-        if len(inputs[0].special_ids) > 0:
-            special_outputs = self.tokenizer.pad(
-                [{"input_ids": input.special_ids} for input in inputs],
-                padding="max_length",
-                max_length=self.config.actor_rollout_ref.rollout.special_response_length,
-                return_tensors="pt",
-                return_attention_mask=True,
-            )
-            special_ids, special_attention_mask = special_outputs['input_ids'], special_outputs['attention_mask']
-
-            batch = TensorDict(
-                {
-                "prompts": prompt_ids,  # [bsz, prompt_length]
-                "responses": response_ids,  # [bsz, response_length]
-                "response_mask": response_mask,  # [bsz, response_length]
-                "input_ids": input_ids,  # [bsz, prompt_length + response_length]
-                "attention_mask": attention_mask,  # [bsz, prompt_length + response_length]
-                "position_ids": position_ids,  # [bsz, prompt_length + response_length]
-                "special_ids": special_ids,
-                "reward_tensor": reward_ids,
-                },
-                batch_size=len(input_ids),
-            )
-
-        else:
-            batch = TensorDict(
+        batch = TensorDict(
                 {
                     "prompts": prompt_ids,  # [bsz, prompt_length]
                     "responses": response_ids,  # [bsz, response_length]
@@ -423,10 +399,75 @@ class AgentLoopWorker:
                 },
                 batch_size=len(input_ids),
             )
+        
+        # special ids
+        if len(inputs[0].special_ids) > 0:
+            special_outputs = self.tokenizer.pad(
+                [{"input_ids": input.special_ids} for input in inputs],
+                padding="max_length",
+                max_length=self.config.actor_rollout_ref.rollout.special_response_length,
+                return_tensors="pt",
+                return_attention_mask=True,
+            )
+            special_ids, special_attention_mask = special_outputs['input_ids'], special_outputs['attention_mask']
+
+            batch["special_ids"] = special_ids
+
+        # sft data
+        if self.config.actor_rollout_ref.rollout.multi_turn.post_process.sft.process_sft_dataset:
+            sft_dataset_dict = {}
+            self.tokenizer.padding_side = "right"
+            sft_dataset_max_length = self.config.actor_rollout_ref.rollout.multi_turn.post_process.sft.sft_max_length
+            sft_input_ids_list = []
+            sft_attention_mask_list = []
+            sft_position_ids_list = []
+            sft_loss_mask_list = []
+            for input in inputs:
+                _sft_dataset = input.sft_dataset
+                for sft_data in _sft_dataset:
+                    sft_prompt_ids = sft_data['prompt_ids']
+                    sft_response_ids = sft_data['response_ids']
+                    sft_input_ids = torch.cat([sft_prompt_ids, sft_response_ids], dim=-1)
+                    sft_attention_mask = torch.cat([sft_data['prompt_attention_mask'], sft_data['response_attention_mask']], dim=-1)
+
+                    # padding to max length
+                    sequence_length = sft_input_ids.shape[0]
+                    if sequence_length < sft_dataset_max_length:
+                        padded_input_ids = (
+                            torch.ones(size=(sft_dataset_max_length - sequence_length,), dtype=sft_input_ids.dtype)
+                            * self.tokenizer.pad_token_id
+                        )
+                        padded_attention_mask = torch.zeros(size=(sft_dataset_max_length - sequence_length,), dtype=sft_attention_mask.dtype)
+                        sft_input_ids = torch.cat((sft_input_ids, padded_input_ids))
+                        sft_attention_mask = torch.cat((sft_attention_mask, padded_attention_mask))
+                    elif sequence_length > sft_dataset_max_length:
+                        raise ValueError(f"sft_input_ids length {sequence_length} is larger than {sft_dataset_max_length}")
+                    
+                    sft_position_ids = compute_position_id_with_mask(sft_attention_mask)
+                    sft_loss_mask = sft_attention_mask.clone()
+                    if sft_prompt_ids.shape[0] > 1:
+                        # mask out prompt for SFT
+                        sft_loss_mask[: sft_prompt_ids.shape[0] - 1] = 0
+                    # mask out the last token in response, or not? see issue https://github.com/volcengine/verl/issues/3562
+                    # sft_loss_mask[min(sft_prompt_ids.shape[0] + sft_response_ids.shape[0], sft_loss_mask.size(0)) - 1] = 0
+
+                    sft_input_ids_list.append(sft_input_ids)
+                    sft_attention_mask_list.append(sft_attention_mask)
+                    sft_position_ids_list.append(sft_position_ids)
+                    sft_loss_mask_list.append(sft_loss_mask)
+            if len(sft_input_ids_list) > 0:
+                sft_input_ids = torch.stack(sft_input_ids_list, dim=0)
+                sft_attention_mask = torch.stack(sft_attention_mask_list, dim=0)
+                sft_position_ids = torch.stack(sft_position_ids_list, dim=0)
+                sft_loss_mask = torch.stack(sft_loss_mask_list, dim=0)
+                sft_dataset_dict["sft_input_ids"] = sft_input_ids
+                sft_dataset_dict["sft_attention_mask"] = sft_attention_mask
+                sft_dataset_dict["sft_position_ids"] = sft_position_ids
+                sft_dataset_dict["sft_loss_mask"] = sft_loss_mask
 
         num_turns = np.array([input.num_turns for input in inputs], dtype=np.int32)
         metrics = [input.metrics.model_dump() for input in inputs]
-        return DataProto(batch=batch, non_tensor_batch={"__num_turns__": num_turns}, meta_info={"metrics": metrics})
+        return DataProto(batch=batch, non_tensor_batch={"__num_turns__": num_turns}, meta_info={"metrics": metrics, "sft_dataset": sft_dataset_dict})
 
 
 async def get_trajectory_info(step, index, validate):
@@ -545,6 +586,18 @@ class AgentLoopManager:
                 for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
             ]
         )
+        # collect sft dataset
+
+        sft_dataset = {}
+        for output in outputs:
+            if len(output.meta_info["sft_dataset"]) > 0:
+                for key, value in output.meta_info["sft_dataset"].items():
+                    if key not in sft_dataset:
+                        sft_dataset[key] = []
+                    sft_dataset[key].append(value)
+        if len(sft_dataset) > 0:
+            sft_dataset = {key: torch.concat(value, dim=0) for key, value in sft_dataset.items()}
+
         output = DataProto.concat(outputs)
         if self.config.actor_rollout_ref.rollout.free_cache_engine:
             self.sleep()
@@ -553,7 +606,7 @@ class AgentLoopManager:
         metrics = [output.meta_info["metrics"] for output in outputs]  # List[List[Dict[str, str]]]
         timing = self._performance_metrics(metrics, output)
         others = self._other_metrics(metrics)
-        output.meta_info = {"timing": timing, "others": others}
+        output.meta_info = {"timing": timing, "others": others, "sft_dataset": sft_dataset}
         return output
 
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:
